@@ -1,0 +1,606 @@
+import random
+
+import requests
+from bs4 import BeautifulSoup
+import discord
+from discord.ext import commands, tasks
+import os
+import sys
+import json
+from random import randint
+from Cogs.SQLite_Schema import PlayerData, ServerSettings
+from sqlalchemy.orm import sessionmaker
+from sqlalchemy import create_engine
+from Cogs.UserDataCog import AddNewUser, AddNewServer
+from PIL import Image,ImageDraw
+from io import BytesIO
+
+
+
+
+engine = create_engine("sqlite:///UserData.db", echo=True, future=True)
+Session = sessionmaker(bind=engine)
+session = Session()
+FilePath = os.path.dirname(os.path.abspath(__file__))
+intents = discord.Intents.all()
+bot = discord.Client(intents=intents)
+
+
+
+class SCPBot(commands.Cog):
+    def __init__(self, bot):
+        self.bot = bot
+        self.CombatLog = []
+        self.ServerBreach = {}
+        self.ActiveCombat = []
+        self.SCPInCombat = None
+        self.SCPCurrentHP = None
+        self.AttackList = {}
+
+        if sys.platform == "linux" or sys.platform == "linux2":
+            with open(f"{FilePath}/Data/Bestiary.json", "r") as Bestiary:
+                self.Bestiary = json.load(Bestiary)
+            with open(f"{FilePath}/Data/Weapons.json", "r") as weapons:
+                self.Weapons = json.load(weapons)
+
+        if sys.platform == "win32" or sys.platform == "win64":
+            with open(f"{FilePath}\\Data\\Bestiary.json", "r") as Bestiary:
+                self.Bestiary = json.load(Bestiary)
+            with open(f"{FilePath}\\Data\\Weapons.json", "r") as weapons:
+                self.Weapons = json.load(weapons)
+
+
+        self.CombatRound = 0
+        self.MissionsList = {}
+        self.SpeakerFace1 = None
+        self.SpeakerFace2 = None
+        self.SpeakerFace3 = None
+        self.BreachMessage = None
+
+########################################################################################################################
+##################################################   Server/Room Settings    ###########################################
+
+    @commands.is_owner()
+    @commands.command()
+    async def SetBreachRoom(self, ctx):
+        try:
+            Settings = session.query(ServerSettings).filter(ServerSettings.GuildID == ctx.guild.id).first()
+            Settings.BreachRoom = ctx.channel.id
+            session.commit()
+        except AttributeError:
+            AddNewServer(GuildID=ctx.guild.id, BreachRoom=ctx.channel.id)
+
+
+    @commands.is_owner()
+    @commands.command()
+    async def SetMedicRoom(self, ctx):
+        try:
+            Settings = session.query(ServerSettings).filter(ServerSettings.GuildID == ctx.guild.id).first()
+            Settings.MedicRoom = ctx.channel.id
+            session.commit()
+        except AttributeError:
+            AddNewServer(GuildID=ctx.guild.id, MedicRoom=ctx.channel.id)
+
+    @commands.is_owner()
+    @commands.command()
+    async def SetMissionRoom(self, ctx):
+        try:
+            Settings = session.query(ServerSettings).filter(ServerSettings.GuildID == ctx.guild.id).first()
+            Settings.MissionRoom = ctx.channel.id
+            session.commit()
+        except AttributeError:
+            AddNewServer(GuildID=ctx.guild.id, MissionRoom=ctx.channel.id)
+
+
+    @commands.command()
+    async def Medic(self, ctx):
+        Player = session.query(PlayerData).filter(PlayerData.User_ID == ctx.author.id).first()
+        try:
+            if Player.Alive == False:
+                await ctx.send("Spent $500 to get back on your feet")
+                Player.Alive = True
+                Player.HP = 100
+                Player.Money -= 500
+                session.commit()
+
+        except AttributeError:
+            return
+
+
+
+########################################################################################################################
+########################################################################################################################
+#####################################################   Combat Logic   #################################################
+    def PlayerDeadCheck(self,UserID):
+        Player = session.query(PlayerData).filter(PlayerData.User_ID == UserID).first()
+        print(Player)
+        print(Player.Alive)
+
+        if Player.Alive == True:
+            return True
+        else:
+            return False
+
+
+
+
+
+
+    def ActiveCombatCount(self,user):
+        count = 0
+        for each in self.ActiveCombat:
+            if each == user:
+                count += 1
+        return count
+
+    def CombatLogToString(self):
+        LogString = ""
+        Page = len(self.CombatLog)
+        if Page-1 < 10:
+            for i in range(Page):
+                LogString += self.CombatLog[Page-1] + "\n"
+                Page -= 1
+            return LogString
+        else:
+            for i in range(10):
+                LogString += self.CombatLog[Page-1] + "\n"
+                Page -= 1
+            return LogString
+
+    async def SCPDeadCheck(self):
+        Count = -1
+        PopList = []
+        for each in self.ServerBreach:
+            Count += 1
+            if each["HP"] <= 0:
+                PopList.append(Count)
+        PopListLenght = len(PopList) - 1
+        if PopListLenght >= 0:
+            for i in range(len(PopList)):
+                #            CombatImage = self.CombatPortrait()
+                DeadPick = self.ServerBreach[PopList[PopListLenght]]
+                self.CombatLog.append(f"{DeadPick['Name']} was contained")
+                self.ServerBreach.pop(PopList[PopListLenght])
+                PopListLenght-=1
+        if len(self.ServerBreach)==0:
+            embed = discord.Embed(title="Breach Concluded")
+            with open(f"{FilePath}\\TEMPCombatLog.txt", 'w') as file:
+                for each in self.CombatLog:
+                    file.writelines(each+"\n")
+            CombatLog = discord.File(f"{FilePath}\\TEMPCombatLog.txt", filename="CombatLog.txt")
+            await self.BreachMessage.edit(embed=embed, view=None, attachments=[CombatLog])
+
+
+
+
+
+
+    async def SCPCombatTurn(self):
+        self.CombatRound += 1
+        Attacks = False
+        X=-1
+        for each in self.ServerBreach:
+            X+=1
+            if each["Turn"] == self.CombatRound:
+                each["Turn"] += each["Bestiary"]["Reflex"]
+                X = random.randint(1, len(self.ActiveCombat))
+                TargetPlayer = session.query(PlayerData).filter(PlayerData.User_ID == self.ActiveCombat[X - 1].id).first()
+                Attacks = True
+                if each["DamageType"] == "Physical":
+                    Defense = TargetPlayer.Tough + TargetPlayer.Power
+                elif each["DamageType"] == "Magic":
+                    Defense = TargetPlayer.Tough + TargetPlayer.Force
+                DefenseCount = self.ActiveCombatCount(self.ActiveCombat[X - 1]) - 1
+                if DefenseCount >= 1:
+                    Damage = int((each["Attack"] - (each["Attack"] * (DefenseCount / 10))) - Defense)
+                else:
+                    Damage = each["Attack"] - Defense
+                Sum = TargetPlayer.HP - Damage
+                if Damage <= 0:
+                    AttackInfo = f"{self.ActiveCombat[X - 1].name} Got hit but the blow was glancing and they took no real damage"
+                    self.CombatLog.append(AttackInfo)
+                elif Sum <= 0:
+                    AttackInfo = f"{self.ActiveCombat[X-1].name} Got hit for {Damage} damage and was killed"
+                    TargetPlayer.Alive = False
+                    TargetPlayer.HP = 0
+                    session.commit()
+                    self.CombatLog.append(AttackInfo)
+                    PopList = []
+                    X = -1
+                    Count = 0
+                    for each in self.ActiveCombat:
+                        X += 1
+                        if each.id == self.ActiveCombat[X - 1].id:
+                            PopList.append(X)
+                            Count += 1
+                    PopLen = len(PopList)
+                    for i in range(PopLen):
+                        PopLen -= 1
+                        self.ActiveCombat.pop(PopList[PopLen])
+
+
+
+
+                elif Sum >= 0:
+                    TargetPlayer.HP -= Damage
+                    AttackInfo = f"{self.ActiveCombat[X-1].name} Got hit for {Damage} damage      HP: {TargetPlayer.HP} / {TargetPlayer.MaxHP}"
+                    session.commit()
+                    self.CombatLog.append(AttackInfo)
+
+        if Attacks == True:
+            CombatLog = self.CombatLogToString()
+            CombatEmbed = discord.Embed(title=f"Combat Report",
+                                        description=CombatLog)
+            await self.BreachMessage.edit(embed=CombatEmbed)
+
+
+
+    def CombatPortrait(self):
+        PicList=[]
+        for each in self.ServerBreach:
+            print(self.ServerBreach)
+            print(each)
+            Pic = each["Bestiary"]["Pic"]
+            if sys.platform == "linux" or sys.platform == "linux2":
+                SCPPic= Image.open(f"{FilePath}/RawPics/SCP/{Pic}", "r")
+            elif sys.platform == "win32" or sys.platform == "win64":
+                SCPPic = Image.open(f"{FilePath}\\RawPics\\SCP\\{Pic}", "r")
+            CurrentHP= each["HP"]
+            MaxHP= each["Bestiary"]["HP"]
+            draw = ImageDraw.Draw(SCPPic)
+            draw.rectangle((10, 5, SCPPic.size[1]-10,SCPPic.size[1]//15 ), fill=(12, 3, 3))
+            draw.rectangle((10, 5, (SCPPic.size[1]-10)//(MaxHP/CurrentHP) ,SCPPic.size[1]//15 ), fill=(160, 3, 3))
+            PicList.append(SCPPic)
+#        BackgroundSize = 1000, 800
+#        Center = 500, 400
+        try:
+            Scale = 800 // len(PicList)
+            Spacing = 1000 // len(PicList)
+            if sys.platform == "linux" or sys.platform == "linux2":
+                Background = Image.open(f"{FilePath}/RawPics/Backgrounds/Hallway_1.png", "r")
+            elif sys.platform == "win32" or sys.platform == "win64":
+                Background = Image.open(f"{FilePath}\\RawPics\\Backgrounds\\Hallway_1.png", "r")
+            Buffer = 400 - Scale//2
+            newsize = Scale, Scale+Scale//3
+            PicCenter = Scale//2,Scale//2
+            Location = Spacing//10, Buffer
+
+            for each in PicList:
+
+                each = each.resize(newsize)
+                Background.alpha_composite(each, dest=Location, source=(0, 0))
+                Location = Location[0]+Spacing,Buffer
+
+            Background.save(f"{FilePath}\\TEMP.png")
+
+
+            TempFile = discord.File(f"{FilePath}\\TEMP.png", filename="TEMP.png")
+            return TempFile
+        except ZeroDivisionError:
+            pass
+
+    async def EndOfTurn(self, Image=None):
+        await self.SCPDeadCheck()
+        CombatLog = self.CombatLogToString()
+        CombatEmbed = discord.Embed(title=f"Combat Report",
+                                    description=CombatLog)
+        if Image == None:
+            await self.BreachMessage.edit(embed=CombatEmbed)
+        else:
+            await self.BreachMessage.edit(embed=CombatEmbed, attachments=[Image])
+
+        await self.SCPCombatTurn()
+
+    def BreachPickLogic(self,ctx,Ammount=1,MaxSlot=5):
+        Count=1
+
+        for each in range(0,Ammount):
+            Pick = random.choice(list(self.Bestiary.keys()))
+            Foe= {
+                      "Target": Count,
+                      "Name": self.Bestiary[str(Pick)]["Name"],
+                      "HP": self.Bestiary[str(Pick)]["HP"],
+                      "Turn": self.Bestiary[str(Pick)]["Reflex"],
+                      "PhysicalDefense": self.Bestiary[str(Pick)]["PhysicalDefense"],
+                      "MagicDefense": self.Bestiary[str(Pick)]["MagicDefense"],
+                      "Attack": self.Bestiary[str(Pick)]["Attack"],
+                      "DamageType": self.Bestiary[str(Pick)]["DamageType"],
+                      "Bestiary": self.Bestiary[str(Pick)]}
+
+            self.ServerBreach.append(Foe)
+            Count += 1
+
+
+    @commands.is_owner()
+    @commands.command()
+    async def Breach(self, ctx, Ammount:int ):
+        await ctx.message.delete()
+        if Ammount >= 26:
+            await ctx.send("Too many, the system can't handle more than 25 at a time.",
+                           delete_after=5)
+            return
+
+        self.ActiveCombat=[]
+        self.ServerBreach=[]
+        self.CombatLog=[]
+        MTFRole = discord.utils.get(ctx.guild.roles, name='MTF')
+        try:
+            Settings = session.query(ServerSettings).filter(ServerSettings.GuildID == ctx.guild.id).first()
+            X = Settings.BreachRoom
+
+        except AttributeError:
+            await ctx.send("No Breach room Set. \n\n Use `A*SetBreachRoom` to set the room the command is used in",
+                           delete_after=15)
+            await ctx.message.delete()
+            return
+
+        Channel = discord.utils.get(ctx.guild.text_channels, id=X)
+
+        self.BreachPickLogic(ctx, Ammount=Ammount)
+
+        View = discord.ui.View()
+
+
+##################################   Attack Button   ###################################################################
+        AttackButton=discord.ui.Button(label="Attack", style=discord.ButtonStyle.green, row=1)
+
+        async def AttackAimButtonCallback(interaction):
+            await interaction.response.defer()
+            await interaction.delete_original_response()
+            if interaction.user not in self.ActiveCombat:
+                self.ActiveCombat.append(interaction.user)
+
+            Player = session.query(PlayerData).filter(PlayerData.User_ID == interaction.user.id).first()
+            Weapon = self.Weapons[Player.Weapon]
+            BaseDamage = Weapon["BaseDamage"]
+            if Weapon["DamageType"] == "Physical":
+                Defense = self.ServerBreach[int(interaction.data['custom_id']) - 1]["PhysicalDefense"]
+            elif Weapon["DamageType"] == "Magic":
+                Defense = self.ServerBreach[int(interaction.data['custom_id']) - 1]["MagicDefense"]
+            if Weapon["DamageBonus"] == "Skill":
+                X = Player.Skill
+            elif Weapon["DamageBonus"] == "Power":
+                X = Player.Power
+            DamageMod = Weapon["DamageMod"]
+            if DamageMod == "+":
+                Z = BaseDamage + X - Defense
+            self.ServerBreach[int(interaction.data['custom_id'])-1]["HP"] -= Z
+            Name = self.ServerBreach[int(interaction.data['custom_id'])-1]["Name"]
+            Target = self.ServerBreach[int(interaction.data['custom_id'])-1]["Target"]
+            await self.SCPDeadCheck()
+            CombatImage = self.CombatPortrait()
+            self.CombatLog.append(f"{interaction.user.name} attacked #{Target} ({Name}) with their {Player.Weapon} and did {Z} damage")
+            CombatLog = self.CombatLogToString()
+
+            CombatEmbed = discord.Embed(title=f"Combat Report",
+                                             description=CombatLog)
+
+            await self.BreachMessage.edit(embed=CombatEmbed, attachments=[CombatImage])
+            await self.SCPCombatTurn()
+
+
+        async def AttackButtonCallback(interaction):
+            Check = self.PlayerDeadCheck(interaction.user.id)
+            print("Check")
+            print(Check)
+
+            if Check == False:
+                embed = discord.Embed(title="You are too damaged to to be effective, go get patched up first")
+                await interaction.response.send_message(ephemeral=True, embed=embed, delete_after=30)
+                return
+            Count=1
+            AttackAimView = discord.ui.View()
+
+            for each in self.ServerBreach:
+                AttackAimButton = discord.ui.Button(label=f"#{each['Target']} ({each['Name']})", style=discord.ButtonStyle.green, custom_id=str(Count))
+                AttackAimView.add_item(AttackAimButton)
+                AttackAimButton.callback = AttackAimButtonCallback
+                Count += 1
+            embed=discord.Embed(title="What are you aiming at?")
+            await interaction.response.send_message(embed=embed, ephemeral=True, view=AttackAimView)
+
+        AttackButton.callback = AttackButtonCallback
+        View.add_item(AttackButton)
+########################################################################################################################
+
+
+#######################################  Defense Button  ###############################################################
+
+        DefenseButton=discord.ui.Button(label="Defense", style=discord.ButtonStyle.green, row=1)
+        async def DefenseButtonCallback(interaction):
+            Check = self.PlayerDeadCheck(interaction.user.id)
+            if Check == False:
+                embed = discord.Embed(title="You are too damaged to to be effective, go get patched up first")
+                await interaction.response.send_message(ephemeral=True, embed=embed, delete_after=30)
+                return
+            await interaction.response.defer()
+            Player = session.query(PlayerData).filter(PlayerData.User_ID == interaction.user.id).first()
+            count = self.ActiveCombatCount(interaction.user)
+            if Player.Skill_Defense1 == True and count == 0:
+                self.CombatLog.append(f"{interaction.user.name} has entered the area in a defensive position")
+                self.ActiveCombat.append(interaction.user)
+                self.ActiveCombat.append(interaction.user)
+                await self.EndOfTurn()
+            if Player.Skill_Defense1 == True and count == 1:
+                self.CombatLog.append(f"{interaction.user.name} has taken a defensive position")
+                self.ActiveCombat.append(interaction.user)
+                await self.EndOfTurn()
+            elif Player.Skill_Defense2 == True and count == 2:
+                self.CombatLog.append(f"{interaction.user.name} has fortified their position")
+                self.ActiveCombat.append(interaction.user)
+                await self.EndOfTurn()
+            elif Player.Skill_Defense3 == True and count == 3:
+                self.CombatLog.append(f"{interaction.user.name} Is dug in deep, only thing getting past them is what gets though them.")
+                self.ActiveCombat.append(interaction.user)
+                await self.EndOfTurn()
+
+
+        DefenseButton.callback = DefenseButtonCallback
+        View.add_item(DefenseButton)
+
+########################################################################################################################
+
+######################################  FallBack Button  ###############################################################
+
+        FallBackButton=discord.ui.Button(label="Fall Back", style=discord.ButtonStyle.green, row=1)
+        async def FallBackButtonCallback(interaction):
+            await interaction.response.defer()
+
+            if interaction.user in self.ActiveCombat:
+                PopList = []
+                X = -1
+                Count = 0
+                for each in self.ActiveCombat:
+                    X+=1
+                    if each.id == interaction.user.id:
+                        PopList.append(X)
+                        Count += 1
+                RetreatCount=1
+                PopLen = len(PopList)
+                for i in range(PopLen):
+                    PopLen -= 1
+                    await self.SCPCombatTurn()
+                    self.ActiveCombat.pop(PopList[PopLen])
+                    self.CombatLog.append(f"{interaction.user.name} preformed a retreat {RetreatCount} / {Count}")
+                    RetreatCount += 1
+                    CombatLog = self.CombatLogToString()
+                    CombatEmbed = discord.Embed(title=f"Combat Report",
+                                                 description=CombatLog)
+                await self.BreachMessage.edit(embed=CombatEmbed)
+
+            else:
+                embed = discord.Embed(description="You can not fall back because you are not a part of this.")
+                await interaction.response.send_message(ephemeral=True, embed=embed, delete_after=10)
+
+        FallBackButton.callback = FallBackButtonCallback
+        View.add_item(FallBackButton)
+########################################################################################################################
+
+########################################################################################################################
+########################################################################################################################
+############################################  Skills Button  ###########################################################
+
+        SkillButton=discord.ui.Button(label="Skills", style=discord.ButtonStyle.green, row=2)
+        async def SkillButtonCallback(interaction):
+            Check = self.PlayerDeadCheck(interaction.user.id)
+            if Check == False:
+                embed = discord.Embed(title="You are too damaged to to be effective, go get patched up first")
+                await interaction.response.send_message(ephemeral=True, embed=embed, delete_after=30)
+                return
+
+            SkillSelectView = discord.ui.View()
+            SkillSelectMenu = discord.ui.Select()
+            Player = session.query(PlayerData).filter(PlayerData.User_ID == interaction.user.id).first()
+
+            async def SkillSelectCallback(interaction):
+################################### Field Medic Skill Logic  ###########################################################
+                if interaction.data["values"][0] == "FieldMedic":
+                    async def FieldMedicSelectCallback(interaction):
+                        HealAmmount = Player.Medic * 2 + 5
+                        OtherPlayer = session.query(PlayerData).filter(PlayerData.User_ID == int(interaction.data["values"][0])).first()
+                        if OtherPlayer.HP+HealAmmount > OtherPlayer.MaxHP:
+                            HealAmmount -= (OtherPlayer.HP + HealAmmount) - OtherPlayer.MaxHP
+                        OtherPlayer.HP += HealAmmount
+                        session.commit()
+                        OtherMember = discord.utils.get(interaction.message.guild.members, id= int(interaction.data['values'][0]))
+                        self.CombatLog.append(f"{interaction.user.name} preformed emergency care on {OtherMember.name} for {HealAmmount}    HP: {OtherPlayer.HP} / {OtherPlayer.MaxHP}")
+                        if interaction.user not in self.ActiveCombat:
+                            self.ActiveCombat.append(interaction.user)
+                        await interaction.response.defer()
+                        await interaction.delete_original_response()
+                        await self.EndOfTurn()
+                    AidList = []
+                    if len(self.ActiveCombat) >0:
+                        for each in self.ActiveCombat:
+                            if each in AidList:
+                                pass
+                            else:
+                                AidList.append(each)
+                        FieldMedicSelectMenu = discord.ui.Select()
+                        FieldMedicView= discord.ui.View()
+                        for each in AidList:
+                            OtherPlayer = session.query(PlayerData).filter(PlayerData.User_ID == each.id).first()
+                            FieldMedicSelectMenu.add_option(label=each.name,
+                                                            value=each.id,
+                                                            description=f"HP: {OtherPlayer.HP} / {OtherPlayer.MaxHP}",
+                                                            emoji=None,
+                                                            default=False)
+                        FieldMedicView.add_item(FieldMedicSelectMenu)
+                        embed = discord.Embed(title="Field Medic: Select who to aid")
+                        FieldMedicSelectMenu.callback = FieldMedicSelectCallback
+                        await interaction.response.edit_message(embed=embed, view=FieldMedicView)
+
+#                    await self.EndOfTurn()
+########################################################################################################################
+
+################################### Skill Display Selection Logic  #####################################################
+
+            if Player.Skill_FieldMedic == True:
+                SkillSelectMenu.add_option(label="Field Medic",
+                                           value="FieldMedic",
+                                           description="Provide aid to yourself or others in active combat",
+                                           emoji=None,
+                                           default=False)
+
+            else:
+                SkillSelectMenu.add_option(label="You have no skill",
+                                           value="GitGud",
+                                           description="Git Gud Scrub",
+                                           emoji=None,
+                                           default=False)
+            embed = discord.Embed(title="Select Skill To Use")
+            SkillSelectMenu.callback = SkillSelectCallback
+            SkillSelectView.add_item(SkillSelectMenu)
+            await interaction.response.send_message(ephemeral=True, embed=embed, view=SkillSelectView, delete_after=150)
+
+########################################################################################################################
+
+        SkillButton.callback = SkillButtonCallback
+        View.add_item(SkillButton)
+
+########################################################################################################################
+########################################################################################################################
+########################################################################################################################
+########################################################################################################################
+
+#############################################  Stats Button  ###########################################################
+
+        StatsButton = discord.ui.Button(label="Stats", style=discord.ButtonStyle.green, row=2)
+        async def StatsButtonCallback(interaction):
+            Player = session.query(PlayerData).filter(PlayerData.User_ID == interaction.user.id).first()
+            StatsDisplay=f" HP: {Player.HP} / {Player.MaxHP}\n Stamina: {Player.Energy} / {Player.MaxEnergy}\n"
+            StatsDisplay += f"Supplys: {Player.Ammo} / {Player.MaxAmmo}\n"
+            if Player.Skill_ThaumaturgicAwakening == True:
+                StatsDisplay += f"MP: {Player.MP} / {Player.MaxMP}\n"
+            embed=discord.Embed(title="Your current combat stats",
+                                description=StatsDisplay)
+            await interaction.response.send_message(ephemeral=True,embed=embed,delete_after=15)
+        StatsButton.callback = StatsButtonCallback
+        View.add_item(StatsButton)
+########################################################################################################################
+############################################  Primary Message and Embed  ################################################
+
+        # First Combat Embed, is what will get edited from here on out
+        CombatImage = self.CombatPortrait()
+        CombatStartEmbed = discord.Embed(title=f"Containment Breach",
+                                         description=f"Calling On-Site {MTFRole.mention}, suppression required!")
+
+        self.BreachMessage = await Channel.send(embed=CombatStartEmbed, view=View, file=CombatImage)
+
+
+
+########################################################################################################################
+########################################################################################################################
+########################################################################################################################
+########################################################################################################################
+
+
+
+
+
+
+
+
+
+async def setup(bot):
+    await bot.add_cog(SCPBot(bot))
